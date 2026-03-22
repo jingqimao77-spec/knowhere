@@ -54,6 +54,40 @@ namespace {
   constexpr _u64  kBruteForceTopkRefineExpansionFactor = 2;
   constexpr float kFilterThreshold = 0.93f;
   constexpr float kAlpha = 0.15f;
+
+  inline void load_bin_mmap_impl(const std::string &bin_file,
+                                 std::unique_ptr<diskann::MemoryMapper> &mapper,
+                                 _u8 *&data, size_t &npts,
+                                 size_t &dim) {
+    mapper = std::make_unique<diskann::MemoryMapper>(bin_file);
+    auto *buf = mapper->getBuf();
+    auto file_size = mapper->getFileSize();
+    if (buf == nullptr || file_size < 2 * sizeof(uint32_t)) {
+      std::stringstream stream;
+      stream << "Error. Failed to mmap file " << bin_file;
+      throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__,
+                                  __LINE__);
+    }
+
+    int npts_i32, dim_i32;
+    std::memcpy(&npts_i32, buf, sizeof(int));
+    std::memcpy(&dim_i32, buf + sizeof(int), sizeof(int));
+    npts = static_cast<unsigned>(npts_i32);
+    dim = static_cast<unsigned>(dim_i32);
+
+    size_t expected_actual_file_size =
+        npts * dim * sizeof(_u8) + 2 * sizeof(uint32_t);
+    if (file_size != expected_actual_file_size) {
+      std::stringstream stream;
+      stream << "Error. File size mismatch. Actual size is " << file_size
+             << " while expected size is " << expected_actual_file_size
+             << " npts = " << npts << " dim = " << dim;
+      throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__,
+                                  __LINE__);
+    }
+
+    data = reinterpret_cast<_u8 *>(buf + 2 * sizeof(uint32_t));
+  }
 }  // namespace
 
 namespace diskann {
@@ -560,7 +594,8 @@ namespace diskann {
   }
 
   template<typename T>
-  int PQFlashIndex<T>::load(uint32_t num_threads, const char *index_prefix) {
+  int PQFlashIndex<T>::load(uint32_t num_threads, const char *index_prefix,
+                            bool use_mmap_pq_vectors) {
     std::string pq_table_bin =
         get_pq_pivots_filename(std::string(index_prefix));
     std::string pq_compressed_vectors =
@@ -590,8 +625,14 @@ namespace diskann {
     this->aligned_dim = ROUND_UP(pq_file_dim, 8);
 
     size_t npts_u64, nchunks_u64;
-    diskann::load_bin<_u8>(pq_compressed_vectors, this->data, npts_u64,
-                           nchunks_u64);
+    if (use_mmap_pq_vectors) {
+      load_bin_mmap_impl(pq_compressed_vectors, this->pq_data_mapper,
+                         this->data, npts_u64, nchunks_u64);
+    } else {
+      diskann::load_bin<_u8>(pq_compressed_vectors, this->owned_data, npts_u64,
+                             nchunks_u64);
+      this->data = this->owned_data.get();
+    }
 
     this->num_points = npts_u64;
     this->n_chunks = nchunks_u64;
@@ -835,7 +876,7 @@ namespace diskann {
 
       if (pq_batch_ids.size() == pq_batch_size || id == num_points - 1) {
         const size_t sz = pq_batch_ids.size();
-        aggregate_coords(pq_batch_ids.data(), sz, this->data.get(), this->n_chunks,
+        aggregate_coords(pq_batch_ids.data(), sz, this->data, this->n_chunks,
                          pq_coord_scratch);
         pq_dist_lookup(pq_coord_scratch, sz, this->n_chunks, pq_dists,
                        dist_scratch);
@@ -1042,7 +1083,7 @@ namespace diskann {
     auto compute_dists = [this, pq_coord_scratch, pq_dists](const unsigned *ids,
                                                             const _u64 n_ids,
                                                             float *dists_out) {
-      aggregate_coords(ids, n_ids, this->data.get(), this->n_chunks,
+      aggregate_coords(ids, n_ids, this->data, this->n_chunks,
                        pq_coord_scratch);
       pq_dist_lookup(pq_coord_scratch, n_ids, this->n_chunks, pq_dists,
                      dists_out);

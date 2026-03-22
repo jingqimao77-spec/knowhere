@@ -24,6 +24,7 @@
 #include "percentile_stats.h"
 #include "pq_table.h"
 #include "utils.h"
+#include "memory_mapper.h"
 #include "diskann/distance.h"
 #include "knowhere/comp/thread_pool.h"
 
@@ -85,7 +86,8 @@ namespace diskann {
     ~PQFlashIndex();
 
     // load compressed data, and obtains the handle to the disk-resident index
-    int load(uint32_t num_threads, const char *index_prefix);
+    int load(uint32_t num_threads, const char *index_prefix,
+             bool use_mmap_pq_vectors = false);
 
     void load_cache_list(std::vector<uint32_t> &node_list);
 
@@ -225,8 +227,10 @@ namespace diskann {
     // data: _u8 * n_chunks
     // chunk_size = chunk size of each dimension chunk
     // pq_tables = float* [[2^8 * [chunk_size]] * n_chunks]
-    std::unique_ptr<_u8[]> data = nullptr;
-    _u64              n_chunks;
+    std::unique_ptr<_u8[]> owned_data = nullptr;
+    _u8                   *data = nullptr;
+    std::unique_ptr<MemoryMapper> pq_data_mapper = nullptr;
+    _u64                   n_chunks;
     FixedChunkPQTable pq_table;
 
     // distance comparator

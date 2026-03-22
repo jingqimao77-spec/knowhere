@@ -203,10 +203,11 @@ base_search() {
         return json;
     };
 
-    auto deserialize_gen = [&base_gen, &metric_str, &metric_dir_map]() {
+    auto deserialize_gen = [&base_gen, &metric_str, &metric_dir_map](bool use_mmap) {
         knowhere::Json json = base_gen();
         json["index_prefix"] = metric_dir_map[metric_str];
         json["search_cache_budget_gb"] = sizeof(float) * kDim * kNumRows * 0.125 / (1024 * 1024 * 1024);
+        json["use_mmap"] = use_mmap;
         return json;
     };
 
@@ -253,7 +254,6 @@ base_search() {
     SECTION("Test search and range search") {
         std::shared_ptr<knowhere::FileManager> file_manager = std::make_shared<knowhere::LocalFileManager>();
         auto diskann_index_pack = knowhere::Pack(file_manager);
-        knowhere::Json deserialize_json = knowhere::Json::parse(deserialize_gen().dump());
         knowhere::BinarySet binset;
         // build process
         {
@@ -265,7 +265,9 @@ base_search() {
             diskann.Build(*ds_ptr, json);
             diskann.Serialize(binset);
         }
-        {
+        for (const bool use_mmap : {false, true}) {
+            auto deserialize_json = knowhere::Json::parse(deserialize_gen(use_mmap).dump());
+
             // knn search
             auto diskann =
                 knowhere::IndexFactory::Instance().Create<DataType>("DISKANN", version, diskann_index_pack).value();
@@ -383,31 +385,34 @@ TEST_CASE("Test DiskANN GetVectorByIds", "[diskann]") {
         {
             std::vector<double> cache_sizes = {0, 1.0f * sizeof(float) * dim * kNumRows * 0.125 / (1024 * 1024 * 1024)};
             for (const auto cache_size : cache_sizes) {
-                auto deserialize_gen = [&base_gen, cache = cache_size]() {
+                auto deserialize_gen = [&base_gen, cache = cache_size](bool use_mmap) {
                     knowhere::Json json = base_gen();
                     json["index_prefix"] = kL2IndexPrefix;
                     json["search_cache_budget_gb"] = cache;
+                    json["use_mmap"] = use_mmap;
                     return json;
                 };
-                knowhere::Json deserialize_json = knowhere::Json::parse(deserialize_gen().dump());
-                auto index = knowhere::IndexFactory::Instance()
-                                 .Create<knowhere::fp32>("DISKANN", version, diskann_index_pack)
-                                 .value();
-                auto ret = index.Deserialize(binset, deserialize_json);
-                REQUIRE(ret == knowhere::Status::success);
-                std::vector<double> ids_sizes = {1, kNumRows * 0.2, kNumRows * 0.7, kNumRows};
-                for (const auto ids_size : ids_sizes) {
-                    std::cout << "Testing dim = " << dim << ", cache_size = " << cache_size
-                              << ", ids_size = " << ids_size << std::endl;
-                    auto ids_ds = GenIdsDataSet(ids_size, ids_size);
-                    auto results = index.GetVectorByIds(*ids_ds);
-                    REQUIRE(results.has_value());
-                    auto xb = (float*)base_ds->GetTensor();
-                    auto data = (float*)results.value()->GetTensor();
-                    for (size_t i = 0; i < ids_size; ++i) {
-                        auto id = ids_ds->GetIds()[i];
-                        for (size_t j = 0; j < dim; ++j) {
-                            REQUIRE(data[i * dim + j] == xb[id * dim + j]);
+                for (const bool use_mmap : {false, true}) {
+                    knowhere::Json deserialize_json = knowhere::Json::parse(deserialize_gen(use_mmap).dump());
+                    auto index = knowhere::IndexFactory::Instance()
+                                     .Create<knowhere::fp32>("DISKANN", version, diskann_index_pack)
+                                     .value();
+                    auto ret = index.Deserialize(binset, deserialize_json);
+                    REQUIRE(ret == knowhere::Status::success);
+                    std::vector<double> ids_sizes = {1, kNumRows * 0.2, kNumRows * 0.7, kNumRows};
+                    for (const auto ids_size : ids_sizes) {
+                        std::cout << "Testing dim = " << dim << ", cache_size = " << cache_size
+                                  << ", use_mmap = " << use_mmap << ", ids_size = " << ids_size << std::endl;
+                        auto ids_ds = GenIdsDataSet(ids_size, ids_size);
+                        auto results = index.GetVectorByIds(*ids_ds);
+                        REQUIRE(results.has_value());
+                        auto xb = (float*)base_ds->GetTensor();
+                        auto data = (float*)results.value()->GetTensor();
+                        for (size_t i = 0; i < ids_size; ++i) {
+                            auto id = ids_ds->GetIds()[i];
+                            for (size_t j = 0; j < dim; ++j) {
+                                REQUIRE(data[i * dim + j] == xb[id * dim + j]);
+                            }
                         }
                     }
                 }

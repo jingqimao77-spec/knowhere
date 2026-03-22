@@ -59,6 +59,8 @@ class DiskANNConfig : public BaseConfig {
     // cached the nodes on the search paths; 2. do bfs from the entry point and cache them. The first method is suitable
     // for TopK query heavy circumstances and the second one performed better in range search.
     CFG_BOOL use_bfs_cache;
+    // Should pq_compressed_vectors be loaded through mmap during deserialize.
+    CFG_BOOL use_mmap;
     // The beamwidth to be used for search. This is the maximum number of IO requests each query will issue per
     // iteration of search code. Larger beamwidth will result in fewer IO round-trips per query but might result in
     // slightly higher total number of IO requests to SSD per query. For the highest query throughput with a fixed SSD
@@ -117,6 +119,10 @@ class DiskANNConfig : public BaseConfig {
             .for_deserialize();
         KNOWHERE_CONFIG_DECLARE_FIELD(use_bfs_cache)
             .description("should bfs strategy to cache nodes.")
+            .set_default(false)
+            .for_deserialize();
+        KNOWHERE_CONFIG_DECLARE_FIELD(use_mmap)
+            .description("whether to use mmap for pq compressed vectors during deserialize.")
             .set_default(false)
             .for_deserialize();
         KNOWHERE_CONFIG_DECLARE_FIELD(beamwidth)

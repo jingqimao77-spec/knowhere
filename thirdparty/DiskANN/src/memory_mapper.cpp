@@ -24,7 +24,6 @@ MemoryMapper::MemoryMapper(const char* filename) {
     return;
   }
   _fileSize = sb.st_size;
-  diskann::cout << "File Size: " << _fileSize << std::endl;
   _buf = (char*) mmap(NULL, _fileSize, PROT_READ, MAP_PRIVATE, _fd, 0);
 }
 char* MemoryMapper::getBuf() {

@@ -393,7 +393,7 @@ DiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, const Config& c
 
     pq_flash_index_ = std::make_unique<diskann::PQFlashIndex<DataType>>(reader, diskann_metric);
     auto disk_ann_call = [&]() {
-        int res = pq_flash_index_->load(search_pool_->size(), index_prefix_.c_str());
+        int res = pq_flash_index_->load(search_pool_->size(), index_prefix_.c_str(), prep_conf.use_mmap.value());
         if (res != 0) {
             throw diskann::ANNException("pq_flash_index_->load returned non-zero value: " + std::to_string(res), -1);
         }
