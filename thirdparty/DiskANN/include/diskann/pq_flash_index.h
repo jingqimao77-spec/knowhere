@@ -230,6 +230,10 @@ namespace diskann {
     std::unique_ptr<_u8[]> owned_data = nullptr;
     _u8                   *data = nullptr;
     std::unique_ptr<MemoryMapper> pq_data_mapper = nullptr;
+    bool                       use_mmap_disk_index = false;
+    std::unique_ptr<MemoryMapper> disk_index_mapper = nullptr;
+    char*                      disk_index_buf = nullptr;
+    size_t                     disk_index_file_size = 0;
     _u64                   n_chunks;
     FixedChunkPQTable pq_table;
 
@@ -292,5 +296,7 @@ namespace diskann {
     _u64                           reoreder_data_offset = 0;
 
     mutable knowhere::lru_cache<uint64_t, uint32_t> lru_cache;
+
+    void read_disk_index(std::vector<AlignedRead>& read_reqs, IOContext& ctx);
   };
 }  // namespace diskann

@@ -113,6 +113,29 @@ namespace diskann {
   }
 
   template<typename T>
+  void PQFlashIndex<T>::read_disk_index(std::vector<AlignedRead> &read_reqs, IOContext &ctx) {
+    if (!use_mmap_disk_index) {
+      reader->read(read_reqs, ctx);
+      return;
+    }
+
+    for (auto &req : read_reqs) {
+      if (req.buf == nullptr) {
+        throw diskann::ANNException("Invalid read request buffer", -1, __FUNCSIG__, __FILE__, __LINE__);
+      }
+      if (req.offset + req.len > this->disk_index_file_size) {
+        std::stringstream stream;
+        stream << "Mmap read out of range. offset=" << req.offset
+               << " len=" << req.len
+               << " file_size=" << this->disk_index_file_size;
+        throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+      }
+      std::memcpy(req.buf, this->disk_index_buf + req.offset, req.len);
+    }
+  }
+
+
+  template<typename T>
   PQFlashIndex<T>::~PQFlashIndex() {
     destroy_cache_async_task();
 
@@ -126,7 +149,9 @@ namespace diskann {
 
     if (load_flag) {
       this->destroy_thread_data();
-      reader->close();
+      if (!use_mmap_disk_index) {
+        reader->close();
+      }
     }
   }
 
@@ -250,7 +275,7 @@ namespace diskann {
         read_reqs.push_back(read);
       }
 
-      reader->read(read_reqs, ctx);
+      read_disk_index(read_reqs, ctx);
 
       _u64 node_idx = start_idx;
       for (_u32 i = 0; i < read_reqs.size(); i++) {
@@ -484,7 +509,7 @@ namespace diskann {
         }
 
         // issue read requests
-        reader->read(read_reqs, ctx);
+        read_disk_index(read_reqs, ctx);
 
         // process each nhood buf
         for (_u32 i = 0; i < read_reqs.size(); i++) {
@@ -568,7 +593,7 @@ namespace diskann {
       medoid_read[0].len = read_len_for_node;
       medoid_read[0].buf = sector_scratch;
       medoid_read[0].offset = get_node_sector_offset(medoid);
-      reader->read(medoid_read, ctx);
+      read_disk_index(medoid_read, ctx);
 
       // all data about medoid
       char *medoid_node_buf = get_offset_to_node(sector_scratch, medoid);
@@ -611,6 +636,7 @@ namespace diskann {
     get_bin_metadata(pq_table_bin, pq_file_num_centroids, pq_file_dim);
 
     this->disk_index_file = disk_index_file;
+    this->use_mmap_disk_index = use_mmap_pq_vectors;
     if (pq_file_num_centroids != 256) {
       LOG(ERROR) << "Error. Number of PQ centroids is not 256. Exitting.";
       return -1;
@@ -669,6 +695,17 @@ namespace diskann {
                  << " (size: " << actual_index_size << ")"
                  << " with meta-data size: " << expected_file_size;
       return -1;
+    }
+
+    if (this->use_mmap_disk_index) {
+      this->disk_index_mapper = std::make_unique<diskann::MemoryMapper>(disk_index_file);
+      this->disk_index_buf = this->disk_index_mapper->getBuf();
+      this->disk_index_file_size = this->disk_index_mapper->getFileSize();
+      if (this->disk_index_buf == nullptr || this->disk_index_file_size != actual_index_size) {
+        std::stringstream stream;
+        stream << "Error. Failed to mmap disk index file " << disk_index_file;
+        throw diskann::ANNException(stream.str(), -1, __FUNCSIG__, __FILE__, __LINE__);
+      }
     }
 
     _u64 disk_nnodes;
@@ -733,8 +770,10 @@ namespace diskann {
     index_metadata.close();
 
     // open AlignedFileReader handle to index_file
-    std::string index_fname(disk_index_file);
-    reader->open(index_fname);
+    if (!this->use_mmap_disk_index) {
+      std::string index_fname(disk_index_file);
+      reader->open(index_fname);
+    }
     this->setup_thread_data(num_threads);
     this->max_nthreads = num_threads;
 
@@ -923,7 +962,7 @@ namespace diskann {
       if (frontier_read_reqs.size() == beam_width ||
           it == nodes_in_sectors_to_visit.cend()) {
         io_timer.reset();
-        reader->read(frontier_read_reqs, ctx);  // synchronous IO linux
+        read_disk_index(frontier_read_reqs, ctx);  // synchronous IO linux
         if (stats != nullptr) {
           stats->io_us += (double) io_timer.elapsed();
         }
@@ -1220,7 +1259,7 @@ namespace diskann {
           num_ios++;
         }
         io_timer.reset();
-        reader->read(frontier_read_reqs, ctx);  // synchronous IO linux
+        read_disk_index(frontier_read_reqs, ctx);  // synchronous IO linux
         if (stats != nullptr) {
           stats->io_us += (double) io_timer.elapsed();
         }
@@ -1363,7 +1402,7 @@ namespace diskann {
       }
 
       io_timer.reset();
-      reader->read(vec_read_reqs, ctx);  // synchronous IO linux
+      read_disk_index(vec_read_reqs, ctx);  // synchronous IO linux
       if (stats != nullptr) {
         stats->io_us += io_timer.elapsed();
       }
@@ -1540,9 +1579,36 @@ namespace diskann {
       sector_offsets.emplace_back(it.first);
     }
 
+    const auto sector_num = sector_offsets.size();
+    const _u64 num_blocks = DIV_ROUND_UP(sector_num, batch_size);
+
+    if (this->use_mmap_disk_index) {
+      IOContext dummy_ctx = 0;
+      for (_u64 i = 0; i < num_blocks; ++i) {
+        _u64 start_idx = i * batch_size;
+        _u64 idx_len = std::min(batch_size, sector_num - start_idx);
+        frontier_read_reqs.clear();
+        for (_u64 j = 0; j < idx_len; ++j) {
+          char *sector_buf = sector_scratch + j * read_len_for_node;
+          frontier_read_reqs.emplace_back(sector_offsets[start_idx + j],
+                                          read_len_for_node, sector_buf);
+        }
+        read_disk_index(frontier_read_reqs, dummy_ctx);
+        for (const auto &req : frontier_read_reqs) {
+          auto  offset = req.offset;
+          char *sector_buf = static_cast<char *>(req.buf);
+          for (auto idx : sectors_to_visit.at(offset)) {
+            char *node_buf = get_offset_to_node(sector_buf, ids[idx]);
+            copy_vec_base_data(output_data, idx, node_buf);
+          }
+        }
+      }
+      this->thread_data.push(data);
+      this->thread_data.push_notify_all();
+      return;
+    }
+
     auto                     ctx = this->reader->get_ctx();
-    const auto               sector_num = sector_offsets.size();
-    const _u64               num_blocks = DIV_ROUND_UP(sector_num, batch_size);
     std::vector<AlignedRead> last_reqs;
     bool                     rotate = false;
 

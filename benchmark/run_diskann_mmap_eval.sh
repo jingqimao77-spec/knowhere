@@ -14,6 +14,16 @@ LD_PATHS="$BUILD_DIR:$BUILD_DIR/generators:$ROOT_DIR/build/Release:$ROOT_DIR/bui
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# Keep these constants in sync with benchmark/hdf5/diskann_mmap_eval.cpp
+BUILD_MAX_DEGREE="56"
+BUILD_SEARCH_LIST_SIZE="128"
+BUILD_DRAM_BUDGET_GB="32.0"
+BUILD_PQ_CODE_BUDGET_NOTE="sizeof(float) * dim * train_rows * 0.125 / GiB"
+QUERY_TOPK="100"
+QUERY_BEAMWIDTH="8"
+QUERY_SEARCH_LIST_SIZE="200"
+QUERY_SEARCH_CACHE_BUDGET_GB="0.0"
+
 metric_from_log() {
     local file="$1"
     local key="$2"
@@ -23,6 +33,11 @@ metric_from_log() {
 residency_from_log() {
     local file="$1"
     awk '/Resident Pages:/{sub(/^  */, ""); print; exit}' "$file"
+}
+
+thread_num_from_log() {
+    local file="$1"
+    awk '/Init global search thread pool with size/ {for (i=1;i<=NF;i++) if ($i=="size") {print $(i+1); exit}}' "$file"
 }
 
 append_results_to_doc() {
@@ -39,7 +54,7 @@ append_results_to_doc() {
 
     local deserialize_0 search_0 recall_0 rss_load_0 rss_search_0 hwm_0
     local deserialize_1 search_1 recall_1 rss_load_1 rss_search_1 hwm_1
-    local residency_0 residency_1
+    local residency_0 residency_1 thread_0 thread_1
 
     deserialize_0="$(metric_from_log "$TMP_DIR/bench_0.log" "deserialize_ms")"
     search_0="$(metric_from_log "$TMP_DIR/bench_0.log" "search_ms")"
@@ -58,6 +73,9 @@ append_results_to_doc() {
     residency_0="$(residency_from_log "$TMP_DIR/evict_0.log")"
     residency_1="$(residency_from_log "$TMP_DIR/evict_1.log")"
 
+    thread_0="$(thread_num_from_log "$TMP_DIR/bench_0.log")"
+    thread_1="$(thread_num_from_log "$TMP_DIR/bench_1.log")"
+
     cat >> "$DOC_PATH" <<DOC
 
 ## Formal Benchmark Run: $ts
@@ -69,6 +87,26 @@ append_results_to_doc() {
 - dataset: $DATASET_PATH
 - work directory: $WORK_DIR
 - index directory: $INDEX_DIR
+
+### Build Parameters
+
+- metric: L2
+- max_degree: $BUILD_MAX_DEGREE
+- build_search_list_size: $BUILD_SEARCH_LIST_SIZE
+- build_dram_budget_gb: $BUILD_DRAM_BUDGET_GB
+- pq_code_budget_gb: $BUILD_PQ_CODE_BUDGET_NOTE
+
+### Query Parameters
+
+- topk: $QUERY_TOPK
+- beamwidth: $QUERY_BEAMWIDTH
+- search_list_size: $QUERY_SEARCH_LIST_SIZE
+- search_cache_budget_gb: $QUERY_SEARCH_CACHE_BUDGET_GB
+
+### Query Threads
+
+- use_mmap=0 search thread pool size: ${thread_0:-unknown}
+- use_mmap=1 search thread pool size: ${thread_1:-unknown}
 
 ### Cache Control
 
@@ -122,7 +160,7 @@ run_mode() {
     } | tee "$evict_log"
 
     echo "--- benchmark use_mmap=$mode ---"
-    LD_LIBRARY_PATH="$LD_PATHS:${LD_LIBRARY_PATH:-}" "$BIN" bench "$DATASET_PATH" "$WORK_DIR" "$mode" | tee "$bench_log"
+    LD_LIBRARY_PATH="$LD_PATHS:${LD_LIBRARY_PATH:-}" "$BIN" bench "$DATASET_PATH" "$WORK_DIR" "$mode" 2>&1 | tee "$bench_log"
 }
 
 run_mode 0

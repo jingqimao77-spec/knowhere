@@ -354,6 +354,7 @@ DiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, const Config& c
     bool is_ip = IsMetricType(prep_conf.metric_type.value(), knowhere::metric::IP);
     bool need_norm = IsMetricType(prep_conf.metric_type.value(), knowhere::metric::IP) ||
                      IsMetricType(prep_conf.metric_type.value(), knowhere::metric::COSINE);
+    bool allow_sample_data = !prep_conf.use_mmap.value();
     auto diskann_metric = [m = prep_conf.metric_type.value()] {
         if (IsMetricType(m, knowhere::metric::L2)) {
             return diskann::Metric::L2;
@@ -366,8 +367,8 @@ DiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, const Config& c
 
     // Load file from file manager.
     for (auto& filename : GetNecessaryFilenames(
-             index_prefix_, need_norm, prep_conf.search_cache_budget_gb.value() > 0 && !prep_conf.use_bfs_cache.value(),
-             prep_conf.warm_up.value())) {
+             index_prefix_, need_norm, allow_sample_data && prep_conf.search_cache_budget_gb.value() > 0 && !prep_conf.use_bfs_cache.value(),
+             allow_sample_data && prep_conf.warm_up.value())) {
         if (!LoadFile(filename)) {
             return Status::disk_file_error;
         }
@@ -431,7 +432,10 @@ DiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, const Config& c
         }
         if (num_nodes_to_cache > 0) {
             LOG_KNOWHERE_INFO_ << "Caching " << num_nodes_to_cache << " sample nodes around medoid(s).";
-            if (prep_conf.use_bfs_cache.value()) {
+            if (prep_conf.use_bfs_cache.value() || !allow_sample_data) {
+                if (!allow_sample_data && !prep_conf.use_bfs_cache.value()) {
+                    LOG_KNOWHERE_INFO_ << "sample_data is disabled in mmap mode, fallback to bfs cache generation";
+                }
                 LOG_KNOWHERE_INFO_ << "Use bfs to generate cache list";
                 if (TryDiskANNCall([&]() { pq_flash_index_->cache_bfs_levels(num_nodes_to_cache, node_list); }) !=
                     Status::success) {
@@ -460,7 +464,7 @@ DiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, const Config& c
     }
 
     // warmup
-    if (prep_conf.warm_up.value()) {
+    if (prep_conf.warm_up.value() && allow_sample_data) {
         LOG_KNOWHERE_INFO_ << "Warming up.";
         uint64_t warmup_L = 20;
         uint64_t warmup_num = 0;
@@ -497,6 +501,10 @@ DiskANNIndexNode<DataType>::Deserialize(const BinarySet& binset, const Config& c
             LOG_KNOWHERE_ERROR_ << "Failed to do search on warmup file for DiskANN.";
             return Status::diskann_inner_error;
         }
+    }
+
+    if (prep_conf.warm_up.value() && !allow_sample_data) {
+        LOG_KNOWHERE_INFO_ << "Skip warmup in mmap mode because sample_data is disabled.";
     }
 
     is_prepared_.store(true);
