@@ -243,6 +243,17 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
         return T();
     }
 
+    template <typename T>
+    T
+    Get(const std::string& k) const {
+        std::shared_lock lock(mutex_);
+        auto it = this->data_.find(k);
+        if (it != this->data_.end()) {
+            return *std::any_cast<T>(std::get_if<std::any>(&it->second));
+        }
+        return T();
+    }
+
  private:
     mutable std::shared_mutex mutex_;
     std::map<std::string, Var> data_;

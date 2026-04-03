@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 #include "diskann/aligned_file_reader.h"
+#include "diskann/grouped_result_collector.h"
 #include "diskann/logger.h"
 #include "diskann/pq_flash_index.h"
 #include <malloc.h>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <random>
 #include <thread>
@@ -884,7 +886,8 @@ namespace diskann {
       _s64 *indices, float *distances, const _u64 beam_width_param,
       IOContext &ctx, QueryStats *stats,
       const knowhere::feder::diskann::FederResultUniq &feder,
-      knowhere::BitsetView                             bitset_view) {
+      knowhere::BitsetView                             bitset_view,
+      const knowhere::group_search::Context          *group_ctx) {
     auto         query_scratch = &(data.scratch);
     const T     *query = data.scratch.aligned_query_T;
     auto         beam_width = beam_width_param * kRefineBeamWidthFactor;
@@ -896,7 +899,10 @@ namespace diskann {
     constexpr _u32 pq_batch_size = MAX_GRAPH_DEGREE;
     std::vector<unsigned> pq_batch_ids;
     pq_batch_ids.reserve(pq_batch_size);
-    const _u64 pq_topk = k_search * kBruteForceTopkRefineExpansionFactor;
+    const bool grouped_search = group_ctx != nullptr && group_ctx->enabled();
+    const _u64 pq_topk = grouped_search
+                             ? (bitset_view.empty() ? num_points : num_points - bitset_view.count())
+                             : k_search * kBruteForceTopkRefineExpansionFactor;
     knowhere::ResultMaxHeap<float, int64_t> pq_max_heap(pq_topk);
     T *data_buf = query_scratch->coord_scratch;
     std::unordered_map<_u64, std::vector<_u64>> nodes_in_sectors_to_visit;
@@ -904,7 +910,13 @@ namespace diskann {
     frontier_read_reqs.reserve(beam_width);
     char *sector_scratch = query_scratch->sector_scratch;
     _u64 &sector_scratch_idx = query_scratch->sector_idx;
-    knowhere::ResultMaxHeap<float, _u64> max_heap(k_search);
+    std::unique_ptr<knowhere::ResultMaxHeap<float, _u64>> max_heap;
+    std::optional<GroupedResultCollector> grouped_results;
+    if (grouped_search) {
+      grouped_results.emplace(k_search, *group_ctx);
+    } else {
+      max_heap = std::make_unique<knowhere::ResultMaxHeap<float, _u64>>(k_search);
+    }
     Timer                                io_timer, query_timer;
 
     // scan un-marked points and calculate pq dists
@@ -936,7 +948,11 @@ namespace diskann {
         if (coord_cache.find(id) != coord_cache.end()) {
           float dist = dist_cmp_wrap(query, coord_cache.at(id),
                                      (size_t) aligned_dim, id);
-          max_heap.Push(dist, id);
+          if (grouped_results.has_value()) {
+            grouped_results->Observe(static_cast<unsigned>(id), dist);
+          } else {
+            max_heap->Push(dist, id);
+          }
           continue;
         }
       }
@@ -977,7 +993,11 @@ namespace diskann {
                    disk_bytes_per_point);  // Do we really need memcpy here?
             float dist = dist_cmp_wrap(query, node_fp_coords_copy,
                                        (size_t) aligned_dim, cur_id);
-            max_heap.Push(dist, cur_id);
+            if (grouped_results.has_value()) {
+              grouped_results->Observe(static_cast<unsigned>(cur_id), dist);
+            } else {
+              max_heap->Push(dist, cur_id);
+            }
             if (feder != nullptr) {
               feder->visit_info_.AddTopCandidateInfo(cur_id, dist);
               feder->id_set_.insert(cur_id);
@@ -989,19 +1009,19 @@ namespace diskann {
       }
     }
 
-    for (_s64 i = k_search - 1; i >= 0; --i) {
-      if ((_u64) i >= max_heap.Size()) {
-        indices[i] = -1;
-        if (distances != nullptr) {
-          distances[i] = -1;
+    if (grouped_results.has_value()) {
+      const auto grouped_top = grouped_results->MaterializeTopK();
+      for (_u64 i = 0; i < k_search; ++i) {
+        if (i >= grouped_top.size()) {
+          indices[i] = -1;
+          if (distances != nullptr) {
+            distances[i] = -1;
+          }
+          continue;
         }
-        continue;
-      }
-      if (const auto op = max_heap.Pop()) {
-        const auto [dis, id] = op.value();
-        indices[i] = id;
+        indices[i] = grouped_top[i].id;
         if (distances != nullptr) {
-          distances[i] = dis;
+          distances[i] = grouped_top[i].distance;
           if (metric == diskann::Metric::INNER_PRODUCT) {
             distances[i] = 1.0 - distances[i] / 2.0;
             if (max_base_norm != 0) {
@@ -1011,8 +1031,33 @@ namespace diskann {
             distances[i] = -distances[i];
           }
         }
-      } else {
-        LOG(ERROR) << "Size is incorrect";
+      }
+    } else {
+      for (_s64 i = k_search - 1; i >= 0; --i) {
+        if ((_u64) i >= max_heap->Size()) {
+          indices[i] = -1;
+          if (distances != nullptr) {
+            distances[i] = -1;
+          }
+          continue;
+        }
+        if (const auto op = max_heap->Pop()) {
+          const auto [dis, id] = op.value();
+          indices[i] = id;
+          if (distances != nullptr) {
+            distances[i] = dis;
+            if (metric == diskann::Metric::INNER_PRODUCT) {
+              distances[i] = 1.0 - distances[i] / 2.0;
+              if (max_base_norm != 0) {
+                distances[i] *= (max_base_norm * query_norm);
+              }
+            } else if (metric == diskann::Metric::COSINE) {
+              distances[i] = -distances[i];
+            }
+          }
+        } else {
+          LOG(ERROR) << "Size is incorrect";
+        }
       }
     }
     if (stats != nullptr) {
@@ -1027,7 +1072,7 @@ namespace diskann {
       float *distances, const _u64 beam_width, const bool use_reorder_data,
       QueryStats *stats, const knowhere::feder::diskann::FederResultUniq &feder,
       knowhere::BitsetView bitset_view, const float filter_ratio_in,
-      const bool for_tuning) {
+      const bool for_tuning, const knowhere::group_search::Context *group_ctx) {
     if (beam_width > MAX_N_SECTOR_READS)
       throw ANNException("Beamwidth can not be higher than MAX_N_SECTOR_READS",
                          -1, __FUNCSIG__, __FILE__, __LINE__);
@@ -1069,7 +1114,8 @@ namespace diskann {
 
       if (bv_cnt >= bitset_view.size() * filter_threshold) {
         brute_force_beam_search(data, query_norm, k_search, indices, distances,
-                                beam_width, ctx, stats, feder, bitset_view);
+                                beam_width, ctx, stats, feder, bitset_view,
+                                group_ctx);
         this->thread_data.push(data);
         this->thread_data.push_notify_all();
         this->reader->put_ctx(ctx);
@@ -1080,7 +1126,8 @@ namespace diskann {
     // Turn to BF is k_search is too large
     if (k_search > 0.5 * (num_points - bv_cnt)) {
       brute_force_beam_search(data, query_norm, k_search, indices, distances,
-                              beam_width, ctx, stats, feder, bitset_view);
+                              beam_width, ctx, stats, feder, bitset_view,
+                              group_ctx);
       this->thread_data.push(data);
       this->thread_data.push_notify_all();
       this->reader->put_ctx(ctx);
@@ -1133,6 +1180,10 @@ namespace diskann {
 
     std::vector<Neighbor> full_retset;
     full_retset.reserve(4096);
+    std::optional<GroupedResultCollector> grouped_results;
+    if (group_ctx != nullptr && group_ctx->enabled()) {
+      grouped_results.emplace(k_search, *group_ctx);
+    }
     auto vec_hash = knowhere::hash_vec(query_float, data_dim);
     _u32 best_medoid = 0;
     // for tuning, do not use cache
@@ -1281,8 +1332,12 @@ namespace diskann {
               cur_expanded_dist = disk_pq_table.l2_distance(
                   query_float, (_u8 *) node_fp_coords_copy);
           }
-          full_retset.push_back(
-              Neighbor((unsigned) node_id, cur_expanded_dist, true));
+          if (grouped_results.has_value()) {
+            grouped_results->Observe((unsigned) node_id, cur_expanded_dist);
+          } else {
+            full_retset.push_back(
+                Neighbor((unsigned) node_id, cur_expanded_dist, true));
+          }
 
           // add top candidate info into feder result
           if (feder != nullptr) {
@@ -1369,11 +1424,14 @@ namespace diskann {
       hops++;
     }
 
-    // re-sort by distance
-    std::sort(full_retset.begin(), full_retset.end(),
-              [](const Neighbor &left, const Neighbor &right) {
-                return left.distance < right.distance;
-              });
+    if (grouped_results.has_value()) {
+      full_retset = grouped_results->MaterializeAllSorted();
+    } else {
+      std::sort(full_retset.begin(), full_retset.end(),
+                [](const Neighbor &left, const Neighbor &right) {
+                  return left.distance < right.distance;
+                });
+    }
 
     if (use_reorder_data) {
       if (!(this->reorder_data_exists)) {

@@ -46,4 +46,13 @@ target_link_libraries(knowhere_tests PRIVATE
         Catch2::Catch2WithMain
         atomic
         stdc++fs
-        knowhere)
+)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(knowhere_tests PRIVATE
+          "-Wl,--whole-archive"
+          knowhere
+          "-Wl,--no-whole-archive")
+else()
+  target_link_libraries(knowhere_tests PRIVATE knowhere)
+endif()

@@ -16,6 +16,7 @@
 
 #include "knowhere/bitsetview.h"
 #include "knowhere/feder/DiskANN.h"
+#include "knowhere/group_search.h"
 
 #include "aligned_file_reader.h"
 #include "concurrent_queue.h"
@@ -106,7 +107,8 @@ namespace diskann {
         const bool use_reorder_data = false, QueryStats *stats = nullptr,
         const knowhere::feder::diskann::FederResultUniq &feder = nullptr,
         knowhere::BitsetView                             bitset_view = nullptr,
-        const float filter_ratio = -1.0f, const bool for_tuning = false);
+        const float filter_ratio = -1.0f, const bool for_tuning = false,
+        const knowhere::group_search::Context          *group_ctx = nullptr);
 
     _u32 range_search(const T *query1, const double range,
                       const _u64 min_l_search, const _u64 max_l_search,
@@ -172,7 +174,8 @@ namespace diskann {
         _s64 *indices, float *distances, const _u64 beam_width_param,
         IOContext &ctx, QueryStats *stats,
         const knowhere::feder::diskann::FederResultUniq &feder,
-        knowhere::BitsetView                             bitset_view);
+        knowhere::BitsetView                             bitset_view,
+        const knowhere::group_search::Context          *group_ctx = nullptr);
 
     // Assign the index of ids to its corresponding sector and if it is in
     // cache, write to the output_data

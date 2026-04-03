@@ -23,11 +23,30 @@
 #include "knowhere/dataset.h"
 #include "knowhere/expected.h"
 #include "knowhere/file_manager.h"
+#include "knowhere/group_search.h"
 #include "knowhere/index/index_factory.h"
 #include "knowhere/log.h"
 #include "knowhere/prometheus_client.h"
 #include "knowhere/range_util.h"
 #include "knowhere/utils.h"
+
+namespace {
+knowhere::group_search::Context
+BuildGroupSearchContext(const knowhere::DataSet& dataset) {
+    knowhere::group_search::Context ctx;
+    const auto internal_to_parent_ord_address = dataset.Get<uint64_t>(knowhere::group_search::kInternalToParentOrdAddressKey);
+    const auto parent_count = dataset.Get<uint64_t>(knowhere::group_search::kParentCountKey);
+    if (internal_to_parent_ord_address == 0 || parent_count == 0) {
+        return ctx;
+    }
+
+    ctx.internal_to_parent_ord = reinterpret_cast<const uint32_t*>(
+        static_cast<std::uintptr_t>(internal_to_parent_ord_address)
+    );
+    ctx.parent_count = static_cast<uint32_t>(parent_count);
+    return ctx;
+}
+}  // namespace
 
 namespace knowhere {
 template <typename DataType>
@@ -533,6 +552,7 @@ DiskANNIndexNode<DataType>::Search(const DataSet& dataset, const Config& cfg, co
     auto nq = dataset.GetRows();
     auto dim = dataset.GetDim();
     auto xq = static_cast<const DataType*>(dataset.GetTensor());
+    const auto group_ctx = BuildGroupSearchContext(dataset);
 
     feder::diskann::FederResultUniq feder_result;
     if (search_conf.trace_visit.value()) {
@@ -550,15 +570,18 @@ DiskANNIndexNode<DataType>::Search(const DataSet& dataset, const Config& cfg, co
     std::vector<folly::Future<folly::Unit>> futures;
     futures.reserve(nq);
     for (int64_t row = 0; row < nq; ++row) {
-        futures.emplace_back(search_pool_->push([&, index = row, p_id_ptr = p_id.get(), p_dist_ptr = p_dist.get()]() {
+        futures.emplace_back(
+            search_pool_->push([&, index = row, p_id_ptr = p_id.get(), p_dist_ptr = p_dist.get(), group_ctx]() {
             diskann::QueryStats stats;
             pq_flash_index_->cached_beam_search(xq + (index * dim), k, lsearch, p_id_ptr + (index * k),
                                                 p_dist_ptr + (index * k), beamwidth, false, &stats, feder_result,
-                                                bitset, filter_ratio, for_tuning);
+                                                bitset, filter_ratio, for_tuning,
+                                                group_ctx.enabled() ? &group_ctx : nullptr);
 #ifdef NOT_COMPILE_FOR_SWIG
             knowhere_diskann_search_hops.Observe(stats.n_hops);
 #endif
-        }));
+        })
+        );
     }
 
     if (TryDiskANNCall([&]() { WaitAllSuccess(futures); }) != Status::success) {
